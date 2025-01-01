@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>WebRTC Video Streaming with Latency Test</title>
+  <style>
+    video {
+      width: 45%; 
+      margin: 2%;
+    }
+    #latencyResults {
+      margin-top: 20px;
+    }
+    #stats {
+      margin-top: 20px;
+    }
+    #canvas {
+      display: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="timestamp"></div>
+  <video id="localVideo" autoplay muted></video>
+  <button id="startLocalRecording">Start Local Recording</button>
+  <button id="stopLocalRecording" disabled>Stop Local Recording</button>
+  <a id="downloadLocalLink" style="display: none;">Download Local Recording</a>
+
+  <div id="timestamp2"></div>
+  <video id="remoteVideo" autoplay></video>
+  <button id="startRemoteRecording">Start Remote Recording</button>
+  <button id="stopRemoteRecording" disabled>Stop Remote Recording</button>
+  <a id="downloadRemoteLink" style="display: none;">Download Remote Recording</a>
+
+  <button id="startTest" disabled>Start Video Latency Test</button>
+
+  <div id="latencyResults"></div>
+  <div id="stats">
+    <h2>WebRTC Statistics</h2>
+    <p>FPS (framesPerSecond): <span id="framesPerSecond">0</span></p>
+    <p>RTT [s]: <span id="rtt">0</span></p>
+    <p>Interarrival Jitter: <span id="jitter">0</span></p>
+    <p>NACK count: <span id="nackCount">0</span></p>
+    <p>Cumulative Number of Packets Lost: <span id="packetsLost">0</span></p>
+    <p>Last Sender Report Timestamp: <span id="lastSenderReport">0</span></p>
+  </div>
+
+  <canvas id="canvas"></canvas>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script>
+    const socket = io();
+
+    const localVideo = document.getElementById('localVideo');
+    const remoteVideo = document.getElementById('remoteVideo');
+    const canvas = document.getElementById('canvas');
+    const startLocalRecordingButton = document.getElementById('startLocalRecording');
+    const stopLocalRecordingButton = document.getElementById('stopLocalRecording');
+    const downloadLocalLink = document.getElementById('downloadLocalLink');
+    const startRemoteRecordingButton = document.getElementById('startRemoteRecording');
+    const stopRemoteRecordingButton = document.getElementById('stopRemoteRecording');
+    const downloadRemoteLink = document.getElementById('downloadRemoteLink');
+    const startTestButton = document.getElementById('startTest');
+    const latencyResults = document.getElementById('latencyResults');
+
+    let localStream;
+    let peerConnection;
+    let dataChannel;
+    let localMediaRecorder;
+    let remoteMediaRecorder;
+    let localRecordedChunks = [];
+    let remoteRecordedChunks = [];
+    let localFrameCaptureInterval;
+    let remoteFrameCaptureInterval;
+    const latencies = [];
+
+    function updateTimestamp() {
+      const now = Date.now(); 
+      document.getElementById('timestamp').innerText = `Unix Timestamp: ${now} ms`;
+      document.getElementById('timestamp2').innerText = `Unix Timestamp: ${now} ms`;
+    }
+    setInterval(updateTimestamp, 1);
+
+    async function checkCameraAvailability() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const hasCamera = devices.some(device => device.kind === 'videoinput');
+
+      if (hasCamera) {
+        startStream();
+      } else {
+        console.error('No camera available');
+        alert('No camera detected. Video stream cannot be started.');
+      }
+    }
+
+    async function getCameraCapabilities() {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(device => device.kind === 'videoinput');
+
+      for (let videoDevice of videoDevices) {
+        const stream = await navigator.mediaDevices.getUserMedia({ 
+          video: { deviceId: { exact: videoDevice.deviceId } }
+        });
+        const videoTrack = stream.getVideoTracks()[0];
+        const capabilities = videoTrack.getCapabilities();
+        videoTrack.stop(); // Stop using the camera
+        stream.getTracks().forEach(track => track.stop()); // Make sure to stop the stream
+
+        console.log(capabilities);
+        return capabilities;
+      }
+    }
+
+    async function startStream() {
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        console.error('getUserMedia is not supported in this browser.');
+        return;
+      }
+
+      try {
+        const capabilities = await getCameraCapabilities();
+        localStream = await navigator.mediaDevices.getUserMedia({ video: {width: { ideal: capabilities.width.max }, height: { ideal: capabilities.height.max }, frameRate: { ideal: capabilities.frameRate.max }}, audio: false });
+        localVideo.srcObject = localStream;
+        initPeerConnection();
+      } catch (error) {
+        console.error('Error accessing media devices.', error);
+      }
+    }
+
+    function initPeerConnection() {
+      peerConnection = new RTCPeerConnection();
+
+      // Create the data channel for latency testing
+      dataChannel = peerConnection.createDataChannel('latencyTest');
+
+      dataChannel.onopen = () => {
+        console.log('Data channel is open');
+        enableLatencyTestButton();
+      };
+
+      dataChannel.onclose = () => {
+        console.log('Data channel is closed');
+        disableLatencyTestButton();
+      };
+
+      dataChannel.onmessage = event => {
+        const endTime = performance.now();
+        const startTime = parseFloat(event.data);
+        const latency = endTime - startTime;
+        if (!isNaN(latency)) {
+          latencies.push(latency);
+          latencyResults.innerHTML += `Video Latency: ${latency} ms<br>`;
+        }
+      };
+
+      peerConnection.ondatachannel = event => {
+        const receiveChannel = event.channel;
+        receiveChannel.onopen = () => {
+          console.log('Remote data channel is open');
+          enableLatencyTestButton();
+        };
+
+        receiveChannel.onclose = () => {
+          console.log('Remote data channel is closed');
+          disableLatencyTestButton();
+        };
+
+        receiveChannel.onmessage = event => {
+          const endTime = performance.now();
+          const startTime = parseFloat(event.data);
+          const latency = endTime - startTime;
+          if (!isNaN(latency)) {
+            latencies.push(latency);
+            latencyResults.innerHTML += `Video Latency: ${latency} ms<br>`;
+          }
+        };
+      };
+
+      peerConnection.onicecandidate = event => {
+        if (event.candidate) {
+          console.log('Sending ICE candidate:', event.candidate);
+          socket.emit('candidate', event.candidate);
+        }
+      };
+
+      peerConnection.oniceconnectionstatechange = () => {
+        console.log('ICE connection state:', peerConnection.iceConnectionState);
+        if (peerConnection.iceConnectionState === 'disconnected' ||
+            peerConnection.iceConnectionState === 'failed') {
+          console.error('ICE connection failed or disconnected');
+        }
+      };
+
+      peerConnection.ontrack = event => {
+        console.log('Remote stream added');
+        remoteVideo.srcObject = event.streams[0];
+      };
+
+      localStream.getTracks().forEach(track => {
+        peerConnection.addTrack(track, localStream);
+      });
+
+      socket.on('offer', async (offer) => {
+        console.log('Received offer:', offer);
+        if (!peerConnection) initPeerConnection();
+
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
+        const answer = await peerConnection.createAnswer();
+        await peerConnection.setLocalDescription(answer);
+        socket.emit('answer', answer);
+      });
+
+      socket.on('answer', async (answer) => {
+        console.log('Received answer:', answer);
+        await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
+      });
+
+      socket.on('candidate', async (candidate) => {
+        console.log('Received candidate:', candidate);
+        await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
+      });
+
+      createOffer();
+
+      // Start getting stats periodically
+      setInterval(updateStats, 1000000);
+    }
+
+    async function createOffer() {
+      const offer = await peerConnection.createOffer();
+      await peerConnection.setLocalDescription(offer);
+      console.log('Sending offer:', offer);
+      socket.emit('offer', offer);
+    }
+
+    async function updateStats() {
+      const stats = await peerConnection.getStats();
+      stats.forEach(report => {
+        if (report.type === 'inbound-rtp' && report.kind === 'video') {
+          document.getElementById('framesPerSecond').innerText = report.framesPerSecond || 0;
+          document.getElementById('packetsLost').innerText = report.packetsLost || 0;
+          document.getElementById('jitter').innerText = report.jitter || 0;
+          document.getElementById('nackCount').innerText = report.nackCount || 0;
+        } else if (report.type === 'remote-inbound-rtp' && report.kind === 'video') {
+          document.getElementById('lastSenderReport').innerText = report.lastSenderReportTimestamp || 0;
+          document.getElementById('rtt').innerText = report.roundTripTime || 'N/A';
+        } 
+      });
+    }
+
+    function enableLatencyTestButton() {
+      startTestButton.disabled = false;
+    }
+
+    function disableLatencyTestButton() {
+      startTestButton.disabled = true;
+    }
+
+    startTestButton.onclick = () => {
+      if (dataChannel && dataChannel.readyState === 'open') {
+        frameCaptureInterval = setInterval(() => {
+          startTime = performance.now();
+          dataChannel.send(startTime.toString());
+        }, 1000); // Capture frame and send timestamp every second
+      } else {
+        console.error('Data channel is not open');
+      }
+    };
+
+    function drawVideoFrame(videoElement, context) {
+      context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+
+      // Draw Unix timestamp on the frame
+      const now = Date.now();
+      const timestamp = `${now} ms`;
+      context.font = "20px Arial";
+      context.fillStyle = "red";
+      context.fillText(timestamp, 10, 30);
+    }
+
+    function startLocalFrameCapture() {
+      canvas.width = localVideo.videoWidth;
+      canvas.height = localVideo.videoHeight;
+      const context = canvas.getContext('2d');
+
+      function captureFrame() {
+        if (localVideo.readyState === localVideo.HAVE_ENOUGH_DATA) {
+          drawVideoFrame(localVideo, context);
+        }
+        localFrameCaptureInterval = requestAnimationFrame(captureFrame);
+      }
+      captureFrame();
+    }
+
+    function startRemoteFrameCapture() {
+      canvas.width = remoteVideo.videoWidth;
+      canvas.height = remoteVideo.videoHeight;
+      const context = canvas.getContext('2d');
+
+      function captureFrame() {
+        if (remoteVideo.readyState === remoteVideo.HAVE_ENOUGH_DATA) {
+          drawVideoFrame(remoteVideo, context);
+        }
+        remoteFrameCaptureInterval = requestAnimationFrame(captureFrame);
+      }
+      captureFrame();
+    }
+
+    // Local recording functions
+    startLocalRecordingButton.onclick = () => {
+      localRecordedChunks = [];
+
+      const localCanvasStream = canvas.captureStream(); // Capture canvas as MediaStream
+      localMediaRecorder = new MediaRecorder(localCanvasStream, { mimeType: 'video/webm' });
+
+      localMediaRecorder.ondataavailable = event => {
+        if (event.data.size > 0) {
+          localRecordedChunks.push(event.data);
+        }
+      };
+
+      localMediaRecorder.onstop = () => {
+        const blob = new Blob(localRecordedChunks, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        downloadLocalLink.href = url;
+        downloadLocalLink.download = 'local_recording.webm';
+        downloadLocalLink.style.display = 'inline';
+        downloadLocalLink.innerText = 'Download Local Recording';
+      };
+
+      localMediaRecorder.start();
+      startLocalFrameCapture();
+      startLocalRecordingButton.disabled = true;
+      stopLocalRecordingButton.disabled = false;
+    };
+
+    stopLocalRecordingButton.onclick = () => {
+      localMediaRecorder.stop();
+      startLocalRecordingButton.disabled = false;
+      stopLocalRecordingButton.disabled = true;
+      cancelAnimationFrame(localFrameCaptureInterval);
+    };
+
+    // Remote recording functions
+    startRemoteRecordingButton.onclick = () => {
+      remoteRecordedChunks = [];
+
+      const remoteCanvasStream = canvas.captureStream(); // Capture canvas as MediaStream
+      remoteMediaRecorder = new MediaRecorder(remoteCanvasStream, { mimeType: 'video/webm' });
+
+      remoteMediaRecorder.ondataavailable = event => {
+        if (event.data.size > 0) {
+          remoteRecordedChunks.push(event.data);
+        }
+      };
+
+      remoteMediaRecorder.onstop = () => {
+        const blob = new Blob(remoteRecordedChunks, { type: 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        downloadRemoteLink.href = url;
+        downloadRemoteLink.download = 'remote_recording.webm';
+        downloadRemoteLink.style.display = 'inline';
+        downloadRemoteLink.innerText = 'Download Remote Recording';
+      };
+
+      remoteMediaRecorder.start();
+      startRemoteFrameCapture();
+      startRemoteRecordingButton.disabled = true;
+      stopRemoteRecordingButton.disabled = false;
+    };
+
+    stopRemoteRecordingButton.onclick = () => {
+      remoteMediaRecorder.stop();
+      startRemoteRecordingButton.disabled = false;
+      stopRemoteRecordingButton.disabled = true;
+      cancelAnimationFrame(remoteFrameCaptureInterval);
+    };
+
+    window.addEventListener('beforeunload', () => {
+      if (localMediaRecorder && localMediaRecorder.state !== "inactive") {
+        localMediaRecorder.stop();
+      }
+      if (remoteMediaRecorder && remoteMediaRecorder.state !== "inactive") {
+        remoteMediaRecorder.stop();
+      }
+      cancelAnimationFrame(localFrameCaptureInterval);
+      cancelAnimationFrame(remoteFrameCaptureInterval);
+    });
+
+    checkCameraAvailability();
+  </script>
+</body>
+</html>
