@@ -22,15 +22,14 @@ struct rtp_header {
     unsigned int ssrc;        // Synchronization source
 };
 
+// change to Hash Table 
+// Hash Table is atomic https://man7.org/linux/man-pages/man2/bpf.2.html
 struct {
-    __uint(type, BPF_MAP_TYPE_ARRAY);
+    __uint(type, BPF_MAP_TYPE_HASH);
     __type(key, __u32);
     __type(value, __u32);
     __uint(max_entries, 3);
 } xdp_stats_map SEC(".maps");
-
-
-
 
 SEC("prog")
 int xdp_rtp_filter(struct xdp_md *ctx) {
@@ -63,32 +62,35 @@ int xdp_rtp_filter(struct xdp_md *ctx) {
     if ((void *)(rtp + 1) > data_end)
         return XDP_PASS;
 
- 
     __u32 key0 = 0;
     __u32 key1 = 1;
     __u32 key2 = 2;
     
-    //byte_count
+    __u32 init_val = 0;
+
+    // byte_count
     __u32 *byte_count = bpf_map_lookup_elem(&xdp_stats_map, &key0);
-    if (!byte_count)
-        return XDP_PASS;  
+    if (!byte_count) {
+        bpf_map_update_elem(&xdp_stats_map, &key0, &init_val, BPF_ANY);
+        byte_count = &init_val;
+    }
 
-    //drop_flag
+    // drop_flag
     __u32 *drop_flag = bpf_map_lookup_elem(&xdp_stats_map, &key1);
-    if (!drop_flag)
-        return XDP_PASS;
-        
-    //rate_limit
+    if (!drop_flag) {
+        bpf_map_update_elem(&xdp_stats_map, &key1, &init_val, BPF_ANY);
+        drop_flag = &init_val;
+    }
+    
+    // rate_limit
     __u32 *rate_limit = bpf_map_lookup_elem(&xdp_stats_map, &key2);
-    if (!rate_limit)
-        return XDP_PASS;
+    if (!rate_limit) {
+        bpf_map_update_elem(&xdp_stats_map, &key2, &init_val, BPF_ANY);
+        rate_limit = &init_val;
+    }
 
-    
     __u32 pkt_size = (__u32)(ctx->data_end - ctx->data);
-    
-    
 
-    
     if (*drop_flag == 1) {
         if (*byte_count + pkt_size > *rate_limit || rtp->m == 0) {
             return XDP_DROP;  
@@ -99,26 +101,17 @@ int xdp_rtp_filter(struct xdp_md *ctx) {
         }
     }
 
-
     if (*byte_count + pkt_size > *rate_limit) {
-       
         if (rtp->m == 1) {  
             *drop_flag = 1;  
             bpf_map_update_elem(&xdp_stats_map, &key1, drop_flag, BPF_ANY);
         }
     }
 
-
     __sync_fetch_and_add(byte_count, pkt_size);
-    
     bpf_map_update_elem(&xdp_stats_map, &key0, byte_count, BPF_ANY);
 
     return XDP_PASS;  
-    
-    
-    
 }
 
 char _license[] SEC("license") = "GPL";
-
-
