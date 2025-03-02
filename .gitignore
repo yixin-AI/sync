@@ -1,4 +1,5 @@
 *.pcapng
 *.pcap
-*.jpg
-*.png
+# *.jpg
+# *.png
+*.ipynb
